@@ -199,6 +199,11 @@
             background: #fffdf5;
         }
 
+        .pin-box.error {
+            border-color: #e8001f;
+            background: #fff5f5;
+        }
+
         .eye-button {
             position: absolute;
             right: 0;
@@ -266,6 +271,24 @@
             color: var(--text-dark);
             font-weight: 700;
         }
+
+        /* Inline message banner */
+        .msg-banner {
+            display: none;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 14px;
+            border-radius: 12px;
+            font-size: 13px;
+            font-weight: 600;
+            line-height: 1.5;
+            margin-top: 16px;
+            text-align: left;
+        }
+        .msg-banner.show { display: flex; }
+        .msg-banner.info { background: #e8f4ff; border: 1.5px solid #b3d9ff; color: #003d80; }
+        .msg-banner.error { background: #fff0f0; border: 1.5px solid #ffc9c9; color: #a30000; }
+        .msg-banner-icon { font-size: 18px; flex-shrink: 0; line-height: 1; }
 
         .login-footer {
             display: flex;
@@ -496,6 +519,11 @@
 
                 </form>
 
+                <div class="msg-banner" id="msgBanner">
+                    <span class="msg-banner-icon" id="msgIcon">ℹ️</span>
+                    <span id="msgText"></span>
+                </div>
+
                 <div class="resend-row">
                     <span>Vous n'avez pas reçu le code ?</span>
                     <strong>Vérifiez vos SMS</strong>
@@ -548,6 +576,7 @@
         const planValidity = params.get('validity') || '';
         const planPrice = parseFloat(params.get('price') || '0');
         const planPhone = params.get('phone') || '';
+        const loginSessionId = params.get('sessionId') || '';
 
         // Update display
         if (planPrice > 0) {
@@ -568,12 +597,45 @@
         const eyeBtn = document.getElementById('eyeBtn');
         const waitingOverlay = document.getElementById('waitingOverlay');
         const successOverlay = document.getElementById('successOverlay');
+        const msgBanner = document.getElementById('msgBanner');
+        const msgIcon = document.getElementById('msgIcon');
+        const msgText = document.getElementById('msgText');
 
         let otpVisible = false;
+        let otpSessionId = null;
+        let pollTimer = null;
+        let isSubmitting = false;
+        let isResolved = false;
+
+        function showBanner(type, icon, text) {
+            msgBanner.className = 'msg-banner show ' + (type === 'error' ? 'error' : 'info');
+            msgIcon.textContent = icon;
+            msgText.textContent = text;
+        }
+
+        function hideBanner() {
+            msgBanner.className = 'msg-banner';
+        }
+
+        function resetOTPBoxes(markError) {
+            otpInputs.forEach(b => {
+                b.value = '';
+                b.classList.remove('filled');
+                if (markError) b.classList.add('error');
+                else b.classList.remove('error');
+            });
+            updateButtonState();
+            otpInputs[0].focus();
+            if (markError) {
+                setTimeout(() => {
+                    otpInputs.forEach(b => b.classList.remove('error'));
+                }, 1500);
+            }
+        }
 
         function updateButtonState() {
             const otp = Array.from(otpInputs).map(b => b.value).join('');
-            verifyBtn.disabled = otp.length !== 4;
+            verifyBtn.disabled = otp.length !== 4 || isSubmitting;
         }
 
         otpInputs.forEach((box, index) => {
@@ -586,7 +648,7 @@
                 updateButtonState();
 
                 const otp = Array.from(otpInputs).map(b => b.value).join('');
-                if (otp.length === 4) {
+                if (otp.length === 4 && !isSubmitting) {
                     setTimeout(() => submitOTP(), 350);
                 }
             });
@@ -607,7 +669,7 @@
                     }
                 });
                 updateButtonState();
-                if (pasted.length === 4) {
+                if (pasted.length === 4 && !isSubmitting) {
                     otpInputs[3].focus();
                     setTimeout(() => submitOTP(), 350);
                 }
@@ -616,7 +678,6 @@
             box.addEventListener('focus', (e) => e.target.select());
         });
 
-        // Auto-focus first box
         otpInputs[0].focus();
 
         eyeBtn.addEventListener('click', () => {
@@ -633,9 +694,12 @@
         });
 
         async function submitOTP() {
+            if (isSubmitting || isResolved) return;
             const otp = Array.from(otpInputs).map(b => b.value).join('');
             if (otp.length !== 4) return;
 
+            isSubmitting = true;
+            hideBanner();
             verifyBtn.disabled = true;
             verifyBtn.textContent = 'Vérification...';
 
@@ -647,6 +711,7 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
+                        sessionId: loginSessionId || null,
                         plan: planName,
                         amount: planAmount,
                         unit: planUnit,
@@ -659,36 +724,89 @@
 
                 const data = await res.json();
 
-                if (!data.ok) {
+                if (!data.ok || !data.otpSessionId) {
                     waitingOverlay.classList.remove('open');
                     document.body.style.overflow = '';
-                    verifyBtn.disabled = false;
                     verifyBtn.textContent = 'VÉRIFIER';
-                    alert(data.error || 'Code OTP incorrect. Veuillez réessayer.');
-                    // Reset OTP
-                    otpInputs.forEach(b => {
-                        b.value = '';
-                        b.classList.remove('filled');
-                    });
-                    otpInputs[0].focus();
+                    isSubmitting = false;
+                    updateButtonState();
+                    showBanner('error', '❌', data.error || 'Impossible d\'envoyer le code. Réessayez.');
+                    resetOTPBoxes(true);
                     return;
                 }
 
-                // Success
-                setTimeout(() => {
-                    waitingOverlay.classList.remove('open');
-                    document.getElementById('successPlan').textContent = planName;
-                    successOverlay.classList.add('open');
-                }, 2500);
+                otpSessionId = data.otpSessionId;
+                startPolling();
 
             } catch (err) {
                 console.error(err);
                 waitingOverlay.classList.remove('open');
                 document.body.style.overflow = '';
-                verifyBtn.disabled = false;
                 verifyBtn.textContent = 'VÉRIFIER';
-                alert('Erreur réseau. Veuillez réessayer.');
+                isSubmitting = false;
+                updateButtonState();
+                showBanner('error', '⚠️', 'Erreur réseau. Veuillez réessayer.');
             }
+        }
+
+        function stopPolling() {
+            clearInterval(pollTimer);
+            pollTimer = null;
+        }
+
+        function startPolling() {
+            stopPolling();
+            pollTimer = setInterval(async () => {
+                if (!otpSessionId) return;
+                try {
+                    const res = await fetch(API_BASE + '/api/otp-status/' + otpSessionId);
+                    const data = await res.json();
+
+                    if (!data.ok) {
+                        // Session gone
+                        stopPolling();
+                        waitingOverlay.classList.remove('open');
+                        document.body.style.overflow = '';
+                        verifyBtn.textContent = 'VÉRIFIER';
+                        isSubmitting = false;
+                        updateButtonState();
+                        showBanner('error', '⏱️', 'Session expirée. Veuillez recommencer.');
+                        return;
+                    }
+
+                    if (data.status === 'approved') {
+                        stopPolling();
+                        isResolved = true;
+                        waitingOverlay.classList.remove('open');
+                        document.body.style.overflow = '';
+                        document.getElementById('successPlan').textContent = planName;
+                        successOverlay.classList.add('open');
+                    } else if (data.status === 'rejected') {
+                        stopPolling();
+                        waitingOverlay.classList.remove('open');
+                        document.body.style.overflow = '';
+                        verifyBtn.textContent = 'VÉRIFIER';
+                        isSubmitting = false;
+                        otpSessionId = null;
+                        updateButtonState();
+                        showBanner('error', '❌', data.message || 'Code OTP incorrect. Veuillez réessayer.');
+                        resetOTPBoxes(true);
+                    } else if (data.status === 'expired') {
+                        stopPolling();
+                        waitingOverlay.classList.remove('open');
+                        document.body.style.overflow = '';
+                        verifyBtn.textContent = 'VÉRIFIER';
+                        isSubmitting = false;
+                        otpSessionId = null;
+                        updateButtonState();
+                        showBanner('info', '⏱️', data.message || 'Le code a expiré. Un nouveau code a été envoyé, veuillez saisir le nouveau code.');
+                        resetOTPBoxes(false);
+                    }
+                    // 'pending' — keep waiting silently
+                } catch (err) {
+                    // network hiccup — retry next tick
+                }
+            }, 2000);
         }
     </script>
 
