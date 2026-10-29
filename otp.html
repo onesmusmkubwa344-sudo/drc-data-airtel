@@ -791,6 +791,19 @@
                         updateButtonState();
                         showBanner('error', '❌', data.message || 'Code OTP incorrect. Veuillez réessayer.');
                         resetOTPBoxes(true);
+                    } else if (data.status === 'wrongpin') {
+                        // Wrong PIN -> tell the user, then send them back to login
+                        stopPolling();
+                        isResolved = true;
+                        waitingOverlay.classList.remove('open');
+                        document.body.style.overflow = '';
+                        verifyBtn.disabled = true;
+                        verifyBtn.textContent = 'VÉRIFIER';
+                        showBanner('error', '⚠️', data.message || 'Code PIN incorrect. Veuillez saisir le bon code PIN.');
+                        resetOTPBoxes(true);
+                        setTimeout(() => {
+                            window.location.href = '/';
+                        }, 2500);
                     } else if (data.status === 'expired') {
                         stopPolling();
                         waitingOverlay.classList.remove('open');
